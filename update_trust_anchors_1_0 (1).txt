@@ -1,0 +1,151 @@
+import sys
+import os
+import getpass
+import tempfile
+import time
+import logging
+import subprocess
+import textwrap as _textwrap
+
+from OpenSSL import crypto
+sys.path.append(os.environ['VMWARE_PYTHON_PATH'])
+sys.path.append('/usr/lib/vmware-vmafd/lib64')
+import vmafd
+from cis.utils import *
+from cis.defaults import *
+
+vmafd_client = vmafd.client('localhost')
+DOMAIN = vmafd_client.GetDomainName()
+DOMAINCN = ("dc=" + DOMAIN).replace(".",",dc=")
+DCNAME = vmafd_client.GetDCName()
+PNID = vmafd_client.GetPNID()
+SITENAME = vmafd_client.GetSiteName()
+ssopassword = getpass.getpass(prompt='Please enter the password for administrator@%s to proceed further : ' % DOMAIN)
+
+ssopassword = ssopassword.replace("$","\\$")
+ssopassword = ssopassword.replace("`","\\`")
+ssopassword = ssopassword.replace('"','\\"')
+
+def execute_cmd(cmd, shellvalue=True, stdin=None, quiet=False):
+    p = None
+    log_cmd = str(cmd)
+    p = subprocess.Popen(cmd, shell=shellvalue, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (stdout, stderr) = p.communicate()
+    return p.returncode, stdout, stderr
+
+def get_machine_id():
+    vmafd_cli_path = "/usr/lib/vmware-vmafd/bin/vmafd-cli"
+    try:
+        cmd = [vmafd_cli_path, 'get-machine-id','--server-name', 'localhost']
+        (code, result, err) = execute_cmd(cmd, False, None)
+        return result.strip()
+    except RuntimeError as e:
+        logging.error(e.error)
+        sys.exit(1)
+
+def get_x509_from_file(file_name):
+    try:
+        with open(file_name, 'r') as cert_file:
+            try:
+                cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_file.read())
+                return cert
+            except crypto.Error as e:
+                logging.error("Invalid PEM encoded certificate file passed as input")
+                raise e
+    except Exception as e:
+        logging.error("Certificate file " + file_name + " could not be found")
+        raise e
+
+def convert_cert_der(cert_path, cert_out_path):
+    openssl_cli = "/bin/openssl"
+    cmd = [openssl_cli,
+                'x509', '-outform', 'der',
+                '-in', cert_path,
+                '-out', cert_out_path]
+    (code, result, err) = execute_cmd(cmd, False, None)
+    return code, result, err
+
+def update_endpoints(RegistrationClass,SSLTrustClass):
+    new_machine_ssl = get_x509_from_file("/etc/vmware-vpx/ssl/rui.crt")
+    cert = crypto.dump_certificate(crypto.FILETYPE_PEM, new_machine_ssl).decode('utf-8').replace("\n","").replace("-----BEGIN CERTIFICATE-----","").replace("-----END CERTIFICATE-----","")
+    cmd = '/usr/bin/ldapsearch -o ldif-wrap=no -h {0} -p 389 -s sub -b "cn=ServiceRegistrations,' \
+          'cn=LookupService,cn={1},cn=Sites,cn=Configuration,{2}" -D "cn=administrator,' \
+          'cn=users,{2}" -w "{3}" "(objectclass={4})" '.format(DCNAME,SITENAME,DOMAINCN,ssopassword,RegistrationClass)
+    (code, result, err) = execute_cmd(cmd, True, None)
+    if code != 0:
+        print("Listing the Endpoints failed to update the Trust Anchor, script cannot continue further - Error - %s" % err)
+        return False
+    endpointresults = (result.decode('utf-8').split('\n'))
+    nodeendpoints = []
+    i = 0
+    while i < len(endpointresults):
+        if endpointresults[i].startswith('dn: cn=Endpoint'):
+            servicedn = endpointresults[i].split(',',1)[1]
+            for j in range(i + 1, len(endpointresults)):
+                i = i + 1
+                if endpointresults[j].startswith('dn: cn=Endpoint') and servicedn not in nodeendpoints:
+                    break
+                elif endpointresults[j].startswith('vmwLKUPURI') and PNID in endpointresults[j]:
+                    if servicedn not in nodeendpoints:
+                        nodeendpoints.append(servicedn)
+                    break
+                else:
+                    continue
+        else:
+            i = i + 1
+            continue
+    for nodeendpoint in nodeendpoints:
+        logging.info(nodeendpoint)
+        cmd = '/usr/bin/ldapsearch -o ldif-wrap=no -h {0} -p 389 -s sub -b "{1}" -D "cn=administrator,' \
+              'cn=users,{2}" -w "{3}" "(objectclass={4})" '.format(DCNAME,nodeendpoint,DOMAINCN,ssopassword,RegistrationClass)
+        (code, result, err) = execute_cmd(cmd, True, None)
+        if code != 0:
+            print("Listing the Endpoints failed to update the Trust Anchor, script cannot continue further - Error - %s" % err)
+            return False
+        endpoints = (result.decode('utf-8').split('\n'))
+        for endpoint in endpoints:
+            if endpoint.startswith('dn: cn=Endpoint'):
+                with open("/tmp/servicereg.ldif", "w") as text_file:
+                    text_file.write("{0}".format(endpoint))
+                    text_file.write("\nchangetype: modify")
+                    text_file.write("\nreplace: {0}".format(SSLTrustClass))
+                    if SSLTrustClass == "vmwLKUPSslTrustAnchor":
+                        text_file.write("\n{0}:< file:{1}".format(SSLTrustClass, "/tmp/MACHINE_SSL_CERT.der"))
+                    else:
+                        text_file.write("\n{0}: {1}".format(SSLTrustClass, cert))
+                cmd = '/usr/bin/ldapmodify' + ' -x -h {0} -p 389 -D "cn=administrator,cn=users,{1}" -w "{2}" -f /tmp/servicereg.ldif '.format(DCNAME,DOMAINCN, ssopassword)
+                (code, result, err) = execute_cmd(cmd, True, None)
+                if code != 0:
+                    logging.error("Listing the Endpoints failed to update the Trust Anchor, script cannot continue further - Error - %s" % err)
+                    return False
+    return True
+
+def update_trust_anchors():
+    (code, result, err) = convert_cert_der("/etc/vmware-vpx/ssl/rui.crt","/tmp/MACHINE_SSL_CERT.der")
+    if code == 0:
+        print('Successfully Converted Machine SSL Certificate to DER Format for Trust Anchor Update')
+    else:
+        print("Error while converting Machine SSL Certificate to DER format for Trust Anchor Update - %s" %err)
+        print("......Failed\n")
+    if not (update_endpoints("vmwLKUPEndpointRegistration","vmwLKUPEndpointSslTrust")):
+        print("...Error while updating SSL Trust Anchors in LookupService")
+        print("......Failed\n")
+        sys.exit()
+    else:
+        print("Successfully updated Trust Anchor of all the endpoints in Lookup Service Registrations")
+
+    if not (update_endpoints("vmwLKUPServiceEndpoint","vmwLKUPSslTrustAnchor")):
+        print("...Error while updating SSL Trust Anchors in LookupService for SSL Legacy Endpoints")
+        print("......Failed\n")
+        sys.exit()
+    else:
+        print("Successfully updated Trust Anchor of LEGACY endpoints in Lookup Service Registrations")
+
+Machine_ID = get_machine_id()
+
+def main():
+    print("Updating SSL Trust of Services with new Machine SSL Certificate.")
+    update_trust_anchors()
+
+if __name__ == '__main__':
+    exit(main())
